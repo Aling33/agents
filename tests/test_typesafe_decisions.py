@@ -226,6 +226,22 @@ async def test_auth_errors_are_not_retried() -> None:
     http.post.assert_called_once()
 
 
+async def test_non_json_success_response_is_not_retried() -> None:
+    model, http = model_for({})
+    response = http.post.return_value
+    response.json = AsyncMock(
+        side_effect=aiohttp.ContentTypeError(MagicMock(), (), message="text/html")
+    )
+    with pytest.raises(APIError) as error:
+        await model.evaluate(
+            chat_ctx=ChatContext.empty(),
+            decisions=QUESTIONS,
+            conn_options=APIConnectOptions(max_retry=2, retry_interval=0),
+        )
+    assert not error.value.retryable
+    http.post.assert_called_once()
+
+
 async def test_retryable_errors_obey_connection_options() -> None:
     model, http = model_for({}, status=503)
     with pytest.raises(APIStatusError):
@@ -320,7 +336,9 @@ async def test_context_events_are_opt_in(include_context_events: bool) -> None:
             FunctionCall(call_id="call-1", name="book", arguments='{"party_size": 2}'),
             FunctionCallOutput(call_id="call-1", name="book", output="No tables", is_error=False),
             AgentHandoff(old_agent_id="booking", new_agent_id="receptionist"),
-            ChatMessage(role="assistant", content=["I can offer"], interrupted=True),
+            ChatMessage(
+                role="assistant", content=['<expr value="warm"/>I can offer'], interrupted=True
+            ),
         ]
     )
     model, http = model_for(response_body())
@@ -334,6 +352,7 @@ async def test_context_events_are_opt_in(include_context_events: bool) -> None:
         assert state[2]["output"] == "No tables"
         assert state[3]["new_agent_id"] == "receptionist"
         assert state[4]["interrupted"] is True
+        assert state[4]["content"] == ["I can offer"]
     else:
         assert state == [
             {"role": "user", "content": "Book a table."},

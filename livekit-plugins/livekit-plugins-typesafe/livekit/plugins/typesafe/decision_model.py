@@ -175,6 +175,8 @@ class DecisionModel(decisions.DecisionModel):
             )
         except asyncio.TimeoutError as exc:
             raise APITimeoutError("TypeSafe request timed out") from exc
+        except aiohttp.ContentTypeError as exc:
+            raise APIError("invalid TypeSafe decision response", retryable=False) from exc
         except aiohttp.ClientError as exc:
             raise APIConnectionError("TypeSafe connection failed") from exc
         except ValueError as exc:
@@ -192,7 +194,9 @@ def _encode_context(chat_ctx: ChatContext, *, include_context_events: bool) -> l
     if include_context_events:
         return cast(
             list[dict[str, Any]],
-            context.to_dict(exclude_metrics=True, exclude_config_update=True)["items"],
+            context.to_dict(exclude_metrics=True, exclude_config_update=True, strip_markup=True)[
+                "items"
+            ],
         )
     return [
         {"role": item.role, "content": item.text_content}
