@@ -46,6 +46,16 @@ def _is_gemini_3_model(model: str) -> bool:
     return "gemini-3" in model.lower()
 
 
+def _is_gemini_4_model(model: str) -> bool:
+    """Check if model is Gemini 4 series (e.g. "gemini-4-argon")"""
+    return "gemini-4" in model.lower()
+
+
+def _is_gemini_3_or_newer(model: str) -> bool:
+    """Check if model is Gemini 3 or later, for the gates those versions share"""
+    return _is_gemini_3_model(model) or _is_gemini_4_model(model)
+
+
 def _is_gemma_4_model(model: str) -> bool:
     """Check if model is Gemma 4 series"""
     return "gemma-4-" in model.lower()
@@ -53,7 +63,12 @@ def _is_gemma_4_model(model: str) -> bool:
 
 def _supports_thinking_level(model: str) -> bool:
     """Check if model configures thinking with a level instead of a token budget"""
-    return _is_gemini_3_model(model) or _is_gemma_4_model(model)
+    return _is_gemini_3_or_newer(model) or _is_gemma_4_model(model)
+
+
+def _ignores_sampling_params(model: str) -> bool:
+    """Check if model ignores temperature/top_p/top_k, which later ones will reject outright"""
+    return _is_gemini_4_model(model)
 
 
 def _function_calling_config(
@@ -89,7 +104,7 @@ def _requires_thought_signatures(model: str) -> bool:
     Gemini 2.5+ models require thought signatures to be stored from responses and
     passed back in subsequent requests for proper multi-turn function calling.
     """
-    if _is_gemini_3_model(model):
+    if _is_gemini_3_or_newer(model):
         return True
     model_lower = model.lower()
     return "gemini-2.5" in model_lower or model_lower.startswith("gemini-2.5")
@@ -118,6 +133,18 @@ class _LLMOptions:
     cached_content: NotGivenOr[str]
     media_resolution: NotGivenOr[types.MediaResolution]
 
+
+# Gemini 4 spends output tokens on thinking, so a low ceiling can end a turn before it
+# answers. Defaults also differ per surface (32K non-streaming, 64K streaming), so the
+# plugin always sends one.
+LONG_DECODE_MIN_OUTPUT_TOKENS = 32768
+# The output budget shares a 1M window with the prompt, so an escalation is capped by
+# what the prompt leaves behind.
+LONG_DECODE_CONTEXT_WINDOW = 1_000_000
+# Complex reasoning runs for minutes; a short client timeout drops a request still in flight.
+LONG_DECODE_HTTP_TIMEOUT_MS = 20 * 60 * 1000
+# A stop so a model that keeps asking to continue cannot run forever.
+LONG_DECODE_MAX_HOPS = 32
 
 BLOCKED_REASONS = [
     types.FinishReason.SAFETY,
@@ -328,7 +355,7 @@ class LLM(llm.LLM):
         # Mixing built-in (provider) tools with function tools is only supported on the
         # Gemini 3 Developer API (not Vertex).
         # https://ai.google.dev/gemini-api/docs/tool-combination
-        is_gemini_3_api = _is_gemini_3_model(self._opts.model) and not self._client.vertexai
+        is_gemini_3_api = _is_gemini_3_or_newer(self._opts.model) and not self._client.vertexai
 
         # cached_content may arrive from the constructor or via extra_kwargs; `_run()` keys
         # off the merged request, so match it here.
@@ -371,14 +398,51 @@ class LLM(llm.LLM):
             extra["response_schema"] = to_response_format(response_format)
             extra["response_mime_type"] = "application/json"
 
-        if is_given(self._opts.temperature):
+        drop_sampling = _ignores_sampling_params(self._opts.model)
+        if drop_sampling:
+            ignored = [
+                name
+                for name, value in (
+                    ("temperature", self._opts.temperature),
+                    ("top_p", self._opts.top_p),
+                    ("top_k", self._opts.top_k),
+                )
+                if is_given(value)
+            ]
+            if ignored:
+                logger.warning(
+                    "gemini llm: model ignores sampling parameters, dropping them from the request",
+                    extra={"model": self._opts.model, "dropped": ignored},
+                )
+
+        if is_given(self._opts.temperature) and not drop_sampling:
             extra["temperature"] = self._opts.temperature
+        if is_given(self._opts.top_p) and not drop_sampling:
+            extra["top_p"] = self._opts.top_p
+        if is_given(self._opts.top_k) and not drop_sampling:
+            extra["top_k"] = self._opts.top_k
+
         if is_given(self._opts.max_output_tokens):
             extra["max_output_tokens"] = self._opts.max_output_tokens
-        if is_given(self._opts.top_p):
-            extra["top_p"] = self._opts.top_p
-        if is_given(self._opts.top_k):
-            extra["top_k"] = self._opts.top_k
+            if (
+                _is_gemini_4_model(self._opts.model)
+                and self._opts.max_output_tokens < LONG_DECODE_MIN_OUTPUT_TOKENS
+            ):
+                # left as asked: a voice agent often wants short replies. Said out loud because
+                # thinking draws on the same budget, so a low ceiling can end the turn with
+                # nothing said.
+                logger.warning(
+                    "gemini llm: max_output_tokens is below the recommended floor for this "
+                    "model; thinking shares the budget, so the turn may finish with no answer",
+                    extra={
+                        "model": self._opts.model,
+                        "max_output_tokens": self._opts.max_output_tokens,
+                        "recommended_minimum": LONG_DECODE_MIN_OUTPUT_TOKENS,
+                    },
+                )
+        elif _is_gemini_4_model(self._opts.model):
+            # the surfaces disagree on the default, so pin it rather than inherit one
+            extra["max_output_tokens"] = LONG_DECODE_MIN_OUTPUT_TOKENS
         if is_given(self._opts.presence_penalty):
             extra["presence_penalty"] = self._opts.presence_penalty
         if is_given(self._opts.frequency_penalty):
@@ -455,6 +519,7 @@ class LLM(llm.LLM):
             tools=tools or [],
             conn_options=conn_options,
             extra_kwargs=extra,
+            caller_set_max_output_tokens=is_given(self._opts.max_output_tokens),
         )
 
     async def aclose(self) -> None:
@@ -478,6 +543,7 @@ class LLMStream(llm.LLMStream):
         conn_options: APIConnectOptions,
         tools: list[llm.Tool],
         extra_kwargs: dict[str, Any],
+        caller_set_max_output_tokens: bool = False,
     ) -> None:
         super().__init__(llm_v, chat_ctx=chat_ctx, tools=tools, conn_options=conn_options)
         self._client = client
@@ -485,6 +551,9 @@ class LLMStream(llm.LLMStream):
         self._llm: LLM = llm_v
         self._extra_kwargs = extra_kwargs
         self._tool_ctx = llm.ToolContext(tools)
+        # a ceiling the caller chose is a budget to respect; one this plugin picked is only a
+        # starting point, and long decode may raise it
+        self._caller_set_max_output_tokens = caller_set_max_output_tokens
 
     async def _run(self) -> None:
         retryable = True
@@ -504,12 +573,17 @@ class LLMStream(llm.LLMStream):
             # attached, `system_instruction` must also live inside the CachedContent
             # resource, so it's dropped from the outgoing request below.
             using_cache = "cached_content" in self._extra_kwargs
+            long_decode = _is_gemini_4_model(self._model)
+            timeout_ms = int(self._conn_options.timeout * 1000)
+            if long_decode:
+                # a reasoning turn runs for minutes; a short read timeout drops a live request
+                timeout_ms = max(timeout_ms, LONG_DECODE_HTTP_TIMEOUT_MS)
             if is_given(self._llm._opts.http_options):
                 http_options = self._llm._opts.http_options.model_copy()
                 if http_options.timeout is None:
-                    http_options.timeout = int(self._conn_options.timeout * 1000)
+                    http_options.timeout = timeout_ms
             else:
-                http_options = types.HttpOptions(timeout=int(self._conn_options.timeout * 1000))
+                http_options = types.HttpOptions(timeout=timeout_ms)
 
             headers = dict(http_options.headers or {})
             headers["x-goog-api-client"] = f"livekit-agents/{__version__}"
@@ -528,68 +602,156 @@ class LLMStream(llm.LLMStream):
                 **self._extra_kwargs,
             )
 
-            stream = await self._client.aio.models.generate_content_stream(
-                model=self._model,
-                contents=cast(types.ContentListUnion, turns),
-                config=config,
-            )
-
             response_generated = False
             finish_reason: types.FinishReason | None = None
-            async for response in stream:
-                if response.prompt_feedback:
-                    raise APIStatusError(
-                        response.prompt_feedback.model_dump_json(),
-                        retryable=False,
-                        request_id=request_id,
+            # Long decode: a turn too large for one request comes back in hops, each carrying
+            # the token that resumes it. The request is resent unchanged apart from that token,
+            # and a run that ran out of room resumes with a larger budget.
+            continuation_token: bytes | None = None
+            max_output_tokens = config.max_output_tokens
+            prompt_tokens = 0
+            # Each hop is its own request and reports its own usage, while a reader of the
+            # stream keeps only the last chunk's. Carry the finished hops forward so the last
+            # chunk covers the whole turn.
+            settled_usage = llm.CompletionUsage(
+                completion_tokens=0, prompt_tokens=0, total_tokens=0
+            )
+
+            for hop in range(LONG_DECODE_MAX_HOPS):
+                if hop:
+                    config = config.model_copy(
+                        update={
+                            "continuation_token": continuation_token,
+                            "max_output_tokens": max_output_tokens,
+                        }
                     )
 
-                if response.usage_metadata is not None:
-                    usage = response.usage_metadata
-                    self._event_ch.send_nowait(
-                        llm.ChatChunk(
-                            id=request_id,
-                            usage=llm.CompletionUsage(
-                                completion_tokens=usage.candidates_token_count or 0,
-                                prompt_tokens=usage.prompt_token_count or 0,
-                                prompt_cached_tokens=usage.cached_content_token_count or 0,
-                                total_tokens=usage.total_token_count or 0,
-                            ),
-                        )
-                    )
+                stream = await self._client.aio.models.generate_content_stream(
+                    model=self._model,
+                    contents=cast(types.ContentListUnion, turns),
+                    config=config,
+                )
 
-                if not response.candidates:
-                    continue
-
-                if len(response.candidates) > 1:
-                    logger.warning(
-                        "gemini llm: there are multiple candidates in the response, returning response from the first one."  # noqa: E501
-                    )
-
-                candidate = response.candidates[0]
-
-                if candidate.finish_reason is not None:
-                    finish_reason = candidate.finish_reason
-                    if candidate.finish_reason in BLOCKED_REASONS:
+                continuation_token = None
+                finish_reason = None
+                hop_usage: llm.CompletionUsage | None = None
+                async for response in stream:
+                    if response.prompt_feedback:
                         raise APIStatusError(
-                            f"generation blocked by gemini: {candidate.finish_reason}",
+                            response.prompt_feedback.model_dump_json(),
                             retryable=False,
                             request_id=request_id,
                         )
 
-                if not candidate.content or not candidate.content.parts:
-                    continue
+                    if response.usage_metadata is not None:
+                        usage = response.usage_metadata
+                        prompt_tokens = usage.prompt_token_count or prompt_tokens
+                        hop_usage = llm.CompletionUsage(
+                            completion_tokens=usage.candidates_token_count or 0,
+                            prompt_tokens=usage.prompt_token_count or 0,
+                            prompt_cached_tokens=usage.cached_content_token_count or 0,
+                            total_tokens=usage.total_token_count or 0,
+                        )
+                        self._event_ch.send_nowait(
+                            llm.ChatChunk(
+                                id=request_id,
+                                # within a hop the counters already restate the whole request,
+                                # so only the finished hops are added to them
+                                usage=llm.CompletionUsage(
+                                    completion_tokens=settled_usage.completion_tokens
+                                    + hop_usage.completion_tokens,
+                                    prompt_tokens=settled_usage.prompt_tokens
+                                    + hop_usage.prompt_tokens,
+                                    prompt_cached_tokens=settled_usage.prompt_cached_tokens
+                                    + hop_usage.prompt_cached_tokens,
+                                    total_tokens=settled_usage.total_tokens
+                                    + hop_usage.total_tokens,
+                                ),
+                            )
+                        )
 
-                for part in candidate.content.parts:
-                    chat_chunk = self._parse_part(request_id, part)
-                    if chat_chunk is not None:
-                        # Only count parts that actually produce output. Thought
-                        # summaries (dropped in _parse_part) must not mark the
-                        # response as generated, otherwise a thought-only turn would
-                        # be treated as successful and skip the retry below.
-                        response_generated = True
-                        retryable = False
-                        self._event_ch.send_nowait(chat_chunk)
+                    if not response.candidates:
+                        continue
+
+                    if len(response.candidates) > 1:
+                        logger.warning(
+                            "gemini llm: there are multiple candidates in the response, returning response from the first one."  # noqa: E501
+                        )
+
+                    candidate = response.candidates[0]
+                    if candidate.continuation_token:
+                        continuation_token = candidate.continuation_token
+
+                    if candidate.finish_reason is not None:
+                        finish_reason = candidate.finish_reason
+                        if candidate.finish_reason in BLOCKED_REASONS:
+                            raise APIStatusError(
+                                f"generation blocked by gemini: {candidate.finish_reason}",
+                                retryable=False,
+                                request_id=request_id,
+                            )
+
+                    if not candidate.content or not candidate.content.parts:
+                        continue
+
+                    for part in candidate.content.parts:
+                        chat_chunk = self._parse_part(request_id, part)
+                        if chat_chunk is not None:
+                            # Only count parts that actually produce output. Thought
+                            # summaries (dropped in _parse_part) must not mark the
+                            # response as generated, otherwise a thought-only turn would
+                            # be treated as successful and skip the retry below.
+                            response_generated = True
+                            retryable = False
+                            self._event_ch.send_nowait(chat_chunk)
+
+                if hop_usage is not None:
+                    settled_usage = llm.CompletionUsage(
+                        completion_tokens=settled_usage.completion_tokens
+                        + hop_usage.completion_tokens,
+                        prompt_tokens=settled_usage.prompt_tokens + hop_usage.prompt_tokens,
+                        prompt_cached_tokens=settled_usage.prompt_cached_tokens
+                        + hop_usage.prompt_cached_tokens,
+                        total_tokens=settled_usage.total_tokens + hop_usage.total_tokens,
+                    )
+
+                if not long_decode or continuation_token is None:
+                    break
+
+                if finish_reason == types.FinishReason.MAX_TOKENS:
+                    if self._caller_set_max_output_tokens:
+                        # the budget the caller set is spent; raising it would spend more than
+                        # they asked for, so the answer comes back at their limit
+                        logger.debug(
+                            "gemini llm: reached the caller's max_output_tokens, "
+                            "returning the answer truncated",
+                            extra={
+                                "model": self._model,
+                                "max_output_tokens": max_output_tokens,
+                            },
+                        )
+                        break
+                    # the run ran out of room rather than finishing: resume with more of it,
+                    # bounded by what the prompt leaves of the shared context window
+                    headroom = LONG_DECODE_CONTEXT_WINDOW - prompt_tokens
+                    raised = min((max_output_tokens or LONG_DECODE_MIN_OUTPUT_TOKENS) * 2, headroom)
+                    if raised <= (max_output_tokens or 0):
+                        logger.warning(
+                            "gemini llm: cannot raise max_output_tokens any further, "
+                            "returning the answer truncated",
+                            extra={"model": self._model, "prompt_tokens": prompt_tokens},
+                        )
+                        break
+                    max_output_tokens = raised
+                elif finish_reason != types.FinishReason.CONTINUATION:
+                    # a token alongside any other reason is not an invitation to resume
+                    break
+            else:
+                logger.warning(
+                    "gemini llm: long decode did not finish within its hop limit, "
+                    "returning the answer truncated",
+                    extra={"model": self._model, "hops": LONG_DECODE_MAX_HOPS},
+                )
 
             if not response_generated:
                 raise APIStatusError(
